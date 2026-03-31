@@ -1,18 +1,14 @@
 {
   "name": "internet-archive-eclipse-addon",
-  "version": "1.0.0",
-  "description": "Internet Archive audio addon for Eclipse Music",
+  "version": "2.0.0",
+  "description": "Multi-track Internet Archive addon for Eclipse Music",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
-    "axios": "^1.7.0",
-    "cors": "^2.8.5",
+    "axios":   "^1.7.0",
+    "cors":    "^2.8.5",
     "express": "^4.19.0",
     "ioredis": "^5.3.2"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  }
+  "engines": { "node": ">=18.0.0" }
 }
