@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-const UA      = 'Mozilla/5.0 (compatible; EclipseIAAddon/1.2.0)';
+const UA      = 'Mozilla/5.0 (compatible; EclipseIAAddon/1.3.0)';
 const IA_BASE = 'https://archive.org';
 
 // ─── Redis ───────────────────────────────────────────────────────────────────
@@ -28,7 +28,6 @@ async function cacheGet(key) {
   try { const d = await redis.get(key); return d ? JSON.parse(d) : null; }
   catch (_e) { return null; }
 }
-
 async function cacheSet(key, value, ttlSeconds) {
   if (!redis) return;
   try { await redis.set(key, JSON.stringify(value), 'EX', ttlSeconds); }
@@ -90,8 +89,6 @@ function getBaseUrl(req) {
 }
 
 // ─── IA HTTP helper ───────────────────────────────────────────────────────────
-// timeoutMs is explicit so search calls can use shorter timeouts (5s)
-// while metadata/stream calls can use longer ones (12s).
 async function iaGet(url, params, timeoutMs) {
   const r = await axios.get(url, {
     params:  params || {},
@@ -101,10 +98,9 @@ async function iaGet(url, params, timeoutMs) {
   return r.data;
 }
 
-// Wrap any promise with a hard timeout that resolves to null instead of throwing.
 function withTimeout(promise, ms) {
   const timer = new Promise(resolve => setTimeout(() => resolve(null), ms));
-  return Promise.race([promise, timer]);
+  return Promise.race([promise.catch(() => null), timer]);
 }
 
 // ─── Metadata (cached 1 hour) ─────────────────────────────────────────────────
@@ -117,46 +113,32 @@ async function fetchMetadata(identifier) {
   return data;
 }
 
-// ─── Search: two-tier, NO metadata fetch ─────────────────────────────────────
-//
-// v1.1 fetched metadata for 5 items in parallel during every search call.
-// Each metadata fetch takes 1-5 seconds — so search could block for 5+ seconds.
-//
-// v1.2 fix: search is now a single IA advancedsearch call (~500ms).
-// Track IDs from search are just the identifier (no filename).
-// The /stream endpoint handles identifier-only IDs by picking the best file.
-//
+// ─── Search (two-tier, no metadata fetches) ───────────────────────────────────
 async function searchAudio(query, limit) {
   const safeKey = 'ia:search3:' + query.toLowerCase().replace(/[^a-z0-9]/g, '_').slice(0, 60);
   const cached  = await cacheGet(safeKey);
   if (cached) return cached;
 
   const fields = 'identifier,title,creator,year,date,downloads';
-
-  // Tier 1 — targeted: title/creator match only, sorted by downloads
   let docs = [];
+
+  // Tier 1 — title/creator match, sorted by downloads
   try {
     const r = await iaGet(`${IA_BASE}/advancedsearch.php`, {
       q:        `(title:("${query}") OR creator:("${query}")) AND mediatype:audio`,
-      output:   'json',
-      rows:     limit || 20,
-      page:     1,
-      'fl[]':   fields,
-      'sort[]': 'downloads desc'
+      output:   'json', rows: limit || 20, page: 1,
+      'fl[]':   fields, 'sort[]': 'downloads desc'
     }, 7000);
     docs = (r && r.response && r.response.docs) || [];
   } catch (_e) {}
 
-  // Tier 2 — broad fallback if tier 1 returned < 3 hits
+  // Tier 2 — broad fallback if < 3 targeted hits
   if (docs.length < 3) {
     try {
       const r2 = await iaGet(`${IA_BASE}/advancedsearch.php`, {
         q:        `(${query}) AND mediatype:audio`,
-        output:   'json',
-        rows:     limit || 20,
-        page:     1,
-        'fl[]':   fields,
-        'sort[]': 'downloads desc'
+        output:   'json', rows: limit || 20, page: 1,
+        'fl[]':   fields, 'sort[]': 'downloads desc'
       }, 7000);
       const broad = (r2 && r2.response && r2.response.docs) || [];
       const seen  = new Set(docs.map(d => d.identifier));
@@ -172,10 +154,11 @@ async function searchAudio(query, limit) {
 }
 
 // ─── Audio file detection ─────────────────────────────────────────────────────
-const NON_AUDIO_EXT = /\.(xml|sqlite|jpg|jpeg|png|gif|txt|nfo|log|pdf|torrent|zip|gz|bz2|json|cue|m3u|m3u8|sha1|md5|htm|html|css|js|db|idx|ffp|st5|asc|info)$/i;
-const AUDIO_EXT     = /\.(mp3|flac|ogg|oga|m4a|aac|wav|opus|shn|wma|spx|ra|rm|ape|wv)$/i;
-const AUDIO_FMT     = /\b(mp3|flac|ogg|vorbis|aac|m4a|wav|opus|shorten|wma|audio)\b/i;
+const NON_AUDIO_EXT = /\.(xml|sqlite|jpg|jpeg|png|gif|bmp|tiff|svg|txt|nfo|log|pdf|torrent|zip|gz|bz2|json|cue|m3u|m3u8|sha1|md5|htm|html|css|js|db|idx|ffp|st5|asc|info|lrc|srt|vtt)$/i;
+const AUDIO_EXT     = /\.(mp3|flac|ogg|oga|m4a|aac|wav|opus|shn|wma|spx|ra|rm|ape|wv|mka|mp4|m4b|aiff|aif)$/i;
+const AUDIO_FMT     = /\b(mp3|flac|ogg|vorbis|aac|m4a|wav|opus|shorten|wma|audio|mpeg|m4b|aiff|lossless)\b/i;
 
+// Primary audio file check — extension or known format field
 function isAudioFile(f) {
   if (!f || !f.name) return false;
   if (f.source === 'metadata') return false;
@@ -185,32 +168,53 @@ function isAudioFile(f) {
   return false;
 }
 
-// ─── Cover art detection ──────────────────────────────────────────────────────
-//
-// archive.org/services/img/{id} returns a black-and-white waveform image for
-// audio items that have no uploaded cover art. This looks bad in Eclipse.
-//
-// When we have the full metadata (album detail), we scan the files list for
-// actual image files and prefer them over the services/img endpoint.
-// If no cover image is found in the file list, we return null (Eclipse
-// shows its own placeholder — better than a waveform).
-//
+// Fallback audio check — used when isAudioFile returns 0 results for an item.
+// Much more permissive: accepts anything that isn't obviously non-audio.
+// Catches items with unusual formats, missing extensions, or non-standard IA metadata.
+function isLikelyAudioFile(f) {
+  if (!f || !f.name) return false;
+  if (f.source === 'metadata') return false;
+  // Exclude files that are definitely not audio
+  if (NON_AUDIO_EXT.test(f.name)) return false;
+  // Exclude video-only formats
+  if (/\.(mp4|mkv|avi|mov|wmv|flv|webm|ogv|mpeg|mpg)$/i.test(f.name)) return false;
+  return true;
+}
+
+// Get audio files from an item's file list.
+// If strict filter returns 0, falls back to the permissive check.
+function getAudioFiles(files) {
+  const strict = (files || []).filter(isAudioFile);
+  if (strict.length > 0) return strict;
+  // Fallback for items with non-standard formats
+  const loose = (files || []).filter(isLikelyAudioFile);
+  console.log(`[audio] strict=0, loose fallback found ${loose.length} files`);
+  return loose;
+}
+
+// ─── Cover art helpers ────────────────────────────────────────────────────────
+function artworkUrl(identifier) {
+  return `${IA_BASE}/services/img/${identifier}`;
+}
+
+// Scan the metadata file list for a real uploaded cover image.
+// Returns a direct download URL if found, or null if only waveform/spectrogram images exist.
+// Caller should fall back to artworkUrl(identifier) if null is returned.
 function findCoverArt(identifier, files) {
   const images = (files || []).filter(f => {
     if (!f || !f.name) return false;
     if (!/\.(jpg|jpeg|png)$/i.test(f.name)) return false;
-    // Skip spectrogram/waveform images that IA auto-generates
-    if (/spectrogram|waveform|spec_|\.spec\.|_spectrogram|_waveform/i.test(f.name)) return false;
+    // Skip auto-generated spectrograms/waveforms from IA's processing pipeline
+    if (/spectrogram|waveform|spec_|\.spec\.|_waveform|itemimage/i.test(f.name)) return false;
     // Skip tiny thumbnails
-    if (/thumb|\.thumb\./i.test(f.name)) return false;
+    if (/thumb\b/i.test(f.name)) return false;
     return true;
   });
 
   if (!images.length) return null;
 
-  // Prefer files with cover-like names
   const preferred = images.find(f =>
-    /\b(cover|folder|front|artwork|album.?art|image|poster)\b/i.test(f.name)
+    /\b(cover|folder|front|artwork|album.?art|image|poster|sleeve)\b/i.test(f.name)
   );
   const img = preferred || images[0];
   return `${IA_BASE}/download/${identifier}/${encodeURIComponent(img.name)}`;
@@ -263,8 +267,6 @@ function parseTrackId(id) {
   };
 }
 
-// Build a full track object from an IA file entry + item metadata.
-// artworkURL is passed in explicitly so album detail can pass a real cover URL.
 function buildTrack(identifier, file, meta, trackIndex, artworkURL) {
   let rawTitle = cleanStr(firstOf(file.title));
   if (!rawTitle || isHashName(rawTitle)) {
@@ -286,7 +288,7 @@ function buildTrack(identifier, file, meta, trackIndex, artworkURL) {
 }
 
 function pickBestFile(files) {
-  const audio = files.filter(isAudioFile);
+  const audio = getAudioFiles(files);
   if (!audio.length) return null;
   const score = f => {
     let s = 0;
@@ -351,7 +353,7 @@ function buildConfigPage(baseUrl) {
   h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>';
   h += '<div class="step"><div class="sn">4</div><div class="st">Select <b>Internet Archive</b> in the search dropdown</div></div>';
   h += '</div></div>';
-  h += '<footer>Internet Archive Addon for Eclipse v1.2.0 • <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
+  h += '<footer>Internet Archive Addon for Eclipse v1.3.0 • <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
   h += '<script>';
   h += 'var _url="";';
   h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";';
@@ -370,7 +372,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '1.2.0', redisConnected: !!(redis && redis.status === 'ready'), activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '1.3.0', redisConnected: !!(redis && redis.status === 'ready'), activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
 });
 
 app.post('/generate', async (req, res) => {
@@ -390,7 +392,7 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   res.json({
     id:          'com.eclipse.internetarchive.' + req.params.token.slice(0, 8),
     name:        'Internet Archive',
-    version:     '1.2.0',
+    version:     '1.3.0',
     description: 'Stream millions of free audio recordings — live concerts, old-time radio, audiobooks, and rare historical recordings from archive.org.',
     icon:        'https://archive.org/images/glogo.jpg',
     resources:   ['search', 'stream', 'catalog'],
@@ -399,42 +401,35 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
 });
 
 // ─── Search ───────────────────────────────────────────────────────────────────
-// v1.2: Zero metadata fetches during search.
-// Tracks come directly from the search docs (identifier only as ID).
-// The /stream endpoint handles identifier-only IDs by picking the best file.
-// artworkURL is null for tracks to avoid the black-and-white waveform thumbnail.
-// Albums use services/img (real cover art shows for items that have it).
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const q = cleanStr(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [] });
 
-  // Hard 10-second ceiling on the entire search response
   const deadline = new Promise(resolve =>
-    setTimeout(() => resolve({ tracks: [], albums: [], _timeout: true }), 10000)
+    setTimeout(() => resolve({ tracks: [], albums: [] }), 10000)
   );
 
   const doSearch = async () => {
     const docs = await searchAudio(q, 20);
     if (!docs.length) return { tracks: [], albums: [] };
 
-    // Albums — one per IA item, artwork from services/img
+    // Albums — artworkURL via services/img (real cover when available)
     const albums = docs.map(doc => ({
       id:         doc.identifier,
       title:      cleanStr(firstOf(doc.title) || doc.identifier),
       artist:     cleanStr(firstOf(doc.creator) || 'Internet Archive'),
-      artworkURL: `${IA_BASE}/services/img/${doc.identifier}`,
+      artworkURL: artworkUrl(doc.identifier),
       year:       cleanStr(firstOf(doc.year) || (firstOf(doc.date) || '').slice(0, 4)) || null,
       trackCount: null
     }));
 
-    // Tracks — same docs, no metadata fetch needed.
-    // ID = just the identifier. artworkURL = null (no waveform thumbnails).
-    // /stream will pick the best file on demand.
+    // Tracks — same docs, ID = identifier only (stream endpoint picks best file).
+    // artworkURL restored to services/img so tracks show cover art in Eclipse.
     const tracks = docs.slice(0, 10).map(doc => ({
       id:         doc.identifier,
       title:      cleanStr(firstOf(doc.title) || doc.identifier),
       artist:     cleanStr(firstOf(doc.creator) || 'Internet Archive'),
-      artworkURL: null,
+      artworkURL: artworkUrl(doc.identifier),
       format:     'mp3'
     }));
 
@@ -451,26 +446,30 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
 });
 
 // ─── Album detail ─────────────────────────────────────────────────────────────
-// Fetches full metadata. Uses findCoverArt() to get a real image file from
-// the item's file list — avoids the waveform from services/img.
 app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   const identifier = req.params.id;
   try {
     const meta = await withTimeout(fetchMetadata(identifier), 12000);
     if (!meta || !meta.metadata) return res.status(404).json({ error: 'Item not found.' });
 
-    const m          = meta.metadata;
-    const allFiles   = meta.files || [];
-    const audioFiles = sortAudioFiles(allFiles.filter(isAudioFile));
-    const coverArt   = findCoverArt(identifier, allFiles);
+    const m        = meta.metadata;
+    const allFiles = meta.files || [];
 
-    console.log(`[album] ${identifier}: ${allFiles.length} total, ${audioFiles.length} audio, cover: ${coverArt ? 'yes' : 'no'}`);
+    // Use getAudioFiles() which falls back to permissive filter if strict returns 0.
+    // This fixes blank albums where IA items have non-standard audio formats.
+    const audioFiles = sortAudioFiles(getAudioFiles(allFiles));
+
+    // Artwork: prefer a real uploaded cover image over services/img.
+    // Fall back to services/img (not null) so albums always show something.
+    const coverArt = findCoverArt(identifier, allFiles) || artworkUrl(identifier);
+
+    console.log(`[album] ${identifier}: ${allFiles.length} total, ${audioFiles.length} audio, cover: ${coverArt}`);
 
     res.json({
       id:          identifier,
       title:       cleanStr(firstOf(m.title) || identifier),
       artist:      cleanStr(firstOf(m.creator) || 'Internet Archive'),
-      artworkURL:  coverArt,   // null if no real image found — Eclipse shows its own placeholder
+      artworkURL:  coverArt,
       year:        cleanStr((firstOf(m.year) || firstOf(m.date) || '').slice(0, 4)) || null,
       description: cleanStr(firstOf(m.description) || ''),
       trackCount:  audioFiles.length,
@@ -483,17 +482,15 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
 });
 
 // ─── Stream resolution ────────────────────────────────────────────────────────
-// Handles two ID formats:
-//   1. "{identifier}___{base64url(filename)}" — direct, no metadata needed
-//   2. "{identifier}" only — fetch metadata and pick the best audio file
 app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
   const { identifier, filename } = parseTrackId(req.params.id);
 
+  // identifier-only ID: fetch metadata and pick the best audio file
   if (!filename) {
     try {
       const meta = await withTimeout(fetchMetadata(identifier), 12000);
       if (!meta) return res.status(504).json({ error: 'Metadata fetch timed out.' });
-      const best = pickBestFile((meta.files || []).filter(isAudioFile));
+      const best = pickBestFile(meta.files || []);
       if (!best) return res.status(404).json({ error: 'No audio file found.' });
       return res.json({
         url:    `${IA_BASE}/download/${identifier}/${encodeURIComponent(best.name)}`,
@@ -504,6 +501,7 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
     }
   }
 
+  // Full ID with filename — direct, no metadata needed
   res.json({
     url:    `${IA_BASE}/download/${identifier}/${encodeURIComponent(filename)}`,
     format: filename.split('.').pop().toLowerCase() || 'mp3'
@@ -512,5 +510,5 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[IA Addon] v1.2.0 running on http://0.0.0.0:${PORT}`);
+  console.log(`[IA Addon] v1.3.0 running on http://0.0.0.0:${PORT}`);
 });
