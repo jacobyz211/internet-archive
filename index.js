@@ -123,37 +123,89 @@ async function fetchMetadata(identifier) {
   return data;
 }
 
-// Search IA audio items, cache results for 5 minutes
+// ─── FIX 1: Two-tier search (targeted first, then broad fallback) ─────────────
+//
+// Targeted: only items where the query is in title OR creator field.
+//           Sorted by downloads (most popular first).
+// Broad:    general full-text search as a fallback if targeted returns < 3 hits.
+// This prevents podcast episodes that *mention* an artist from dominating results.
+//
 async function searchAudio(query, limit) {
-  const safeKey = query.toLowerCase().replace(/[^a-z0-9]/g, '_').slice(0, 60);
-  const key     = 'ia:search:' + safeKey;
-  const cached  = await cacheGet(key);
+  const safeKey = 'ia:search2:' + query.toLowerCase().replace(/[^a-z0-9]/g, '_').slice(0, 60);
+  const cached  = await cacheGet(safeKey);
   if (cached) return cached;
 
-  const data = await iaGet(`${IA_BASE}/advancedsearch.php`, {
-    q:       `(${query}) AND mediatype:audio`,
-    output:  'json',
-    rows:    limit || 20,
-    page:    1,
-    'fl[]':  'identifier,title,creator,year,date,description,subject,downloads'
-  });
+  const fields = 'identifier,title,creator,year,date,description,subject,downloads';
 
-  const docs = (data && data.response && data.response.docs) || [];
-  await cacheSet(key, docs, 300);
+  // Tier 1 — title/creator match, sorted by downloads
+  let docs = [];
+  try {
+    const r = await iaGet(`${IA_BASE}/advancedsearch.php`, {
+      q:        `(title:("${query}") OR creator:("${query}")) AND mediatype:audio`,
+      output:   'json',
+      rows:     limit || 20,
+      page:     1,
+      'fl[]':   fields,
+      'sort[]': 'downloads desc'
+    });
+    docs = (r && r.response && r.response.docs) || [];
+  } catch (_e) {}
+
+  // Tier 2 — broad fallback if we got fewer than 3 targeted hits
+  if (docs.length < 3) {
+    try {
+      const r2 = await iaGet(`${IA_BASE}/advancedsearch.php`, {
+        q:        `(${query}) AND mediatype:audio`,
+        output:   'json',
+        rows:     limit || 20,
+        page:     1,
+        'fl[]':   fields,
+        'sort[]': 'downloads desc'
+      });
+      const broadDocs = (r2 && r2.response && r2.response.docs) || [];
+      // Merge: targeted first, then broad (no duplicates)
+      const seen = new Set(docs.map(d => d.identifier));
+      for (const d of broadDocs) {
+        if (!seen.has(d.identifier)) { seen.add(d.identifier); docs.push(d); }
+        if (docs.length >= (limit || 20)) break;
+      }
+    } catch (_e) {}
+  }
+
+  await cacheSet(safeKey, docs, 180); // 3-minute cache
   return docs;
 }
 
-// ─── Audio file helpers ───────────────────────────────────────────────────────
+// ─── FIX 2: Robust audio file detection ───────────────────────────────────────
+//
+// Previous version only checked file extension. IA stores files with:
+//   - format: "VBR MP3", "128Kbps MP3", "Ogg Vorbis", "Flac", "Shorten", etc.
+//   - extensions: .mp3, .flac, .ogg, .shn (Shorten — used in etree concerts), .m4a, etc.
+// We now check BOTH extension AND format field, and exclude non-audio by extension.
+//
+const NON_AUDIO_EXT = /\.(xml|sqlite|jpg|jpeg|png|gif|txt|nfo|log|pdf|torrent|zip|gz|bz2|json|cue|m3u|m3u8|sha1|md5|htm|html|css|js|db|idx|ffp|st5|md5|asc|info)$/i;
+const AUDIO_EXT     = /\.(mp3|flac|ogg|oga|m4a|aac|wav|opus|shn|wma|spx|ra|rm|ape|wv)$/i;
+const AUDIO_FMT     = /\b(mp3|flac|ogg|vorbis|aac|m4a|wav|opus|shorten|wma|audio)\b/i;
+
 function isAudioFile(f) {
-  return /\.(mp3|flac|ogg|m4a|aac|wav|opus)$/i.test(f.name || '')
-    && f.source !== 'metadata'
-    && f.source !== 'collection';
+  if (!f || !f.name) return false;
+  if (f.source === 'metadata') return false;             // .xml, .sqlite descriptors
+  if (NON_AUDIO_EXT.test(f.name)) return false;          // obvious non-audio by extension
+  if (AUDIO_EXT.test(f.name)) return true;               // known audio extension ✓
+  if (AUDIO_FMT.test(f.format || '')) return true;       // known audio format field ✓
+  return false;
 }
 
-function formatFromName(name) {
-  const ext = (name || '').split('.').pop().toLowerCase();
-  const map  = { mp3: 'mp3', flac: 'flac', ogg: 'ogg', m4a: 'm4a', aac: 'aac', wav: 'wav', opus: 'ogg' };
-  return map[ext] || 'mp3';
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function formatFromFile(f) {
+  const ext = (f.name || '').split('.').pop().toLowerCase();
+  const fmt = (f.format || '').toLowerCase();
+  if (ext === 'flac' || /flac/.test(fmt))            return 'flac';
+  if (ext === 'ogg'  || /ogg|vorbis/.test(fmt))      return 'ogg';
+  if (ext === 'm4a'  || /m4a|aac/.test(fmt))         return 'm4a';
+  if (ext === 'wav'  || /wav/.test(fmt))              return 'wav';
+  if (ext === 'opus' || /opus/.test(fmt))             return 'ogg';
+  return 'mp3'; // default / shn derivatives are usually served as mp3
 }
 
 function parseDuration(d) {
@@ -172,11 +224,28 @@ function cleanStr(s) {
 }
 
 function firstOf(v) {
-  // IA fields can be a string or an array
   return Array.isArray(v) ? v[0] : v;
 }
 
-// Build a stable, URL-safe track ID: identifier___base64url(filename)
+// ─── FIX 3: Better track title extraction ─────────────────────────────────────
+//
+// IA file entries can have:
+//   - file.title:  clean track title (when set by uploader)
+//   - file.name:   filename — may be a hash (e.g. "iztbbkgurvn1w...") or clean
+// If file.title is absent or looks like a hash, fall back to item title + track number.
+//
+function isHashName(s) {
+  return /^[a-f0-9]{8,}$/i.test(s) || /^[a-zA-Z0-9]{20,}$/.test(s);
+}
+
+function cleanFilenameAsTitle(filename) {
+  return filename
+    .replace(/\.[^.]+$/, '')
+    .replace(/[_-]/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 function buildTrackId(identifier, filename) {
   return identifier + '___' + Buffer.from(filename).toString('base64url');
 }
@@ -194,11 +263,23 @@ function artworkUrl(identifier) {
   return `${IA_BASE}/services/img/${identifier}`;
 }
 
-// Build an Eclipse-compatible track object from an IA file entry + item metadata
-function buildTrack(identifier, file, meta) {
-  const title  = cleanStr(firstOf(file.title)  || file.name.replace(/\.[^.]+$/, '').replace(/[_-]/g, ' '));
-  const artist = cleanStr(firstOf(file.artist) || firstOf(file.creator) || firstOf(meta && meta.creator) || 'Internet Archive');
+function buildTrack(identifier, file, meta, trackIndex) {
+  let rawTitle = cleanStr(firstOf(file.title));
+  if (!rawTitle || isHashName(rawTitle)) {
+    const fromFilename = cleanFilenameAsTitle(file.name);
+    rawTitle = isHashName(fromFilename)
+      ? (cleanStr(firstOf(meta && meta.title)) + (trackIndex != null ? ' — Track ' + (trackIndex + 1) : ''))
+      : fromFilename;
+  }
+  const title  = rawTitle || 'Unknown Track';
+  const artist = cleanStr(
+    firstOf(file.artist)  ||
+    firstOf(file.creator) ||
+    firstOf(meta && meta.creator) ||
+    'Internet Archive'
+  );
   const album  = cleanStr(firstOf(meta && meta.title) || '');
+
   return {
     id:         buildTrackId(identifier, file.name),
     title,
@@ -206,21 +287,28 @@ function buildTrack(identifier, file, meta) {
     album:      album || null,
     duration:   parseDuration(file.length),
     artworkURL: artworkUrl(identifier),
-    format:     formatFromName(file.name),
+    format:     formatFromFile(file),
     streamURL:  `${IA_BASE}/download/${identifier}/${encodeURIComponent(file.name)}`
   };
 }
 
-// Prefer MP3 > FLAC > other for a single representative track
 function pickBestFile(files) {
   const audio = files.filter(isAudioFile);
-  return audio.find(f => /\.mp3$/i.test(f.name))
-      || audio.find(f => /\.flac$/i.test(f.name))
-      || audio[0]
-      || null;
+  if (!audio.length) return null;
+
+  const score = f => {
+    let s = 0;
+    const ext = (f.name || '').split('.').pop().toLowerCase();
+    if (ext === 'mp3') s += 10;
+    else if (ext === 'flac' || ext === 'ogg') s += 5;
+    const t = cleanStr(firstOf(f.title));
+    if (t && !isHashName(t)) s += 20;
+    return s;
+  };
+
+  return audio.slice().sort((a, b) => score(b) - score(a))[0] || null;
 }
 
-// Sort audio files by track number, then filename
 function sortAudioFiles(files) {
   return files.slice().sort((a, b) => {
     const at = parseInt(firstOf(a.track) || '0') || 0;
@@ -241,7 +329,7 @@ function buildConfigPage(baseUrl) {
   h += '.logo{margin-bottom:24px;display:flex;align-items:center;gap:14px}';
   h += '.logo-text{font-size:20px;font-weight:700;color:#fff;line-height:1.2}.logo-sub{font-size:12px;color:#555}';
   h += '.card{background:#111118;border:1px solid #1e1e2e;border-radius:18px;padding:36px;max-width:540px;width:100%;box-shadow:0 24px 64px rgba(0,0,0,.6);margin-bottom:20px}';
-  h += 'h1{font-size:22px;font-weight:700;margin-bottom:6px;color:#fff}h2{font-size:16px;font-weight:700;margin-bottom:14px;color:#fff}';
+  h += 'h1{font-size:22px;font-weight:700;margin-bottom:6px;color:#fff}';
   h += 'p.sub{font-size:14px;color:#777;margin-bottom:20px;line-height:1.6}';
   h += '.tip{background:#0a0f1e;border:1px solid #1a2a4a;border-radius:10px;padding:12px 14px;margin-bottom:20px;font-size:12px;color:#4a7abb;line-height:1.7}.tip b{color:#6aadff}';
   h += '.pills{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px}';
@@ -259,13 +347,11 @@ function buildConfigPage(baseUrl) {
   h += '.sn{background:#141420;border:1px solid #1e1e2e;border-radius:50%;width:26px;height:26px;min-width:26px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#555}';
   h += '.st{font-size:13px;color:#666;line-height:1.6}.st b{color:#aaa}';
   h += 'footer{margin-top:32px;font-size:12px;color:#333;text-align:center;line-height:1.8}</style></head><body>';
-  // Logo
   h += '<div class="logo"><svg width="44" height="44" viewBox="0 0 44 44" fill="none"><rect width="44" height="44" rx="10" fill="#1a3a6e"/><path d="M8 22 C8 14 14 8 22 8 C30 8 36 14 36 22 C36 30 30 36 22 36" stroke="#4a9eff" stroke-width="2.5" stroke-linecap="round" fill="none"/><circle cx="22" cy="22" r="4" fill="#4a9eff"/><line x1="22" y1="8" x2="22" y2="36" stroke="#4a9eff" stroke-width="1" opacity="0.3"/><line x1="8" y1="22" x2="36" y2="22" stroke="#4a9eff" stroke-width="1" opacity="0.3"/></svg>';
   h += '<div><div class="logo-text">Internet Archive</div><div class="logo-sub">Eclipse Music Addon</div></div></div>';
-  // Main card
   h += '<div class="card"><h1>Internet Archive for Eclipse</h1>';
   h += '<div class="tip"><b>Free forever.</b> The Internet Archive is a nonprofit library — millions of concerts, old-time radio shows, audiobooks, and historical recordings, all freely streamable.</div>';
-  h += '<p class="sub">Search and stream audio from archive.org directly inside Eclipse. Browse live concert recordings, rare albums, classic radio, and more.</p>';
+  h += '<p class="sub">Search and stream audio from archive.org directly inside Eclipse. Best for live concerts (Grateful Dead, Phish, etc.), old-time radio, audiobooks, and rare recordings.</p>';
   h += '<div class="pills"><span class="pill">Live concerts</span><span class="pill">Old-time radio</span><span class="pill g">Free &amp; open</span><span class="pill">Audiobooks</span><span class="pill">Historical recordings</span></div>';
   h += '<button class="bb" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
   h += '<div class="box" id="genBox"><div class="blbl">Your addon URL — paste into Eclipse</div><div class="burl" id="genUrl"></div><button class="bd" id="copyBtn" onclick="copyUrl()">Copy URL</button></div>';
@@ -273,10 +359,9 @@ function buildConfigPage(baseUrl) {
   h += '<div class="step"><div class="sn">1</div><div class="st">Click <b>Generate</b> above and copy your URL</div></div>';
   h += '<div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> → Settings → Connections → Add Connection → Addon</div></div>';
   h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>';
-  h += '<div class="step"><div class="sn">4</div><div class="st">Select <b>Internet Archive</b> in the search dropdown and start exploring</div></div>';
+  h += '<div class="step"><div class="sn">4</div><div class="st">Select <b>Internet Archive</b> in the search dropdown — works best for live concerts, old radio, and audiobooks</div></div>';
   h += '</div></div>';
-  // Footer
-  h += '<footer>Internet Archive Addon for Eclipse v1.0.0 • <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
+  h += '<footer>Internet Archive Addon for Eclipse v1.1.0 • <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
   h += '<script>';
   h += 'var _url="";';
   h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";';
@@ -297,7 +382,7 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status:         'ok',
-    version:        '1.0.0',
+    version:        '1.1.0',
     redisConnected: !!(redis && redis.status === 'ready'),
     activeTokens:   TOKEN_CACHE.size,
     timestamp:      new Date().toISOString()
@@ -323,7 +408,7 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   res.json({
     id:          'com.eclipse.internetarchive.' + req.params.token.slice(0, 8),
     name:        'Internet Archive',
-    version:     '1.0.0',
+    version:     '1.1.0',
     description: 'Stream millions of free audio recordings — live concerts, old-time radio, audiobooks, and rare historical recordings from archive.org.',
     icon:        'https://archive.org/images/glogo.jpg',
     resources:   ['search', 'stream', 'catalog'],
@@ -340,7 +425,6 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
     const docs = await searchAudio(q, 20);
     if (!docs.length) return res.json({ tracks: [], albums: [] });
 
-    // All docs → albums (each IA item = an album/collection of audio files)
     const albums = docs.map(doc => ({
       id:         doc.identifier,
       title:      cleanStr(firstOf(doc.title) || doc.identifier),
@@ -350,7 +434,6 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
       trackCount: null
     }));
 
-    // Fetch full metadata for top 5 docs in parallel → extract representative track
     const topDocs    = docs.slice(0, 5);
     const trackProms = topDocs.map(doc =>
       fetchMetadata(doc.identifier)
@@ -360,7 +443,7 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
           if (!audio.length) return null;
           const best = pickBestFile(audio);
           if (!best) return null;
-          return buildTrack(doc.identifier, best, meta.metadata);
+          return buildTrack(doc.identifier, best, meta.metadata, null);
         })
         .catch(() => null)
     );
@@ -381,7 +464,10 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
     if (!meta || !meta.metadata) return res.status(404).json({ error: 'Item not found.' });
 
     const m          = meta.metadata;
-    const audioFiles = sortAudioFiles((meta.files || []).filter(isAudioFile));
+    const allFiles   = meta.files || [];
+    const audioFiles = sortAudioFiles(allFiles.filter(isAudioFile));
+
+    console.log(`[album] ${identifier}: ${allFiles.length} total files, ${audioFiles.length} audio`);
 
     res.json({
       id:          identifier,
@@ -391,7 +477,7 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
       year:        cleanStr((firstOf(m.year) || firstOf(m.date) || '').slice(0, 4)) || null,
       description: cleanStr(firstOf(m.description) || ''),
       trackCount:  audioFiles.length,
-      tracks:      audioFiles.map(f => buildTrack(identifier, f, m))
+      tracks:      audioFiles.map((f, i) => buildTrack(identifier, f, m, i))
     });
   } catch (e) {
     console.error('[album] error:', e.message);
@@ -403,7 +489,6 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
 app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
   const { identifier, filename } = parseTrackId(req.params.id);
 
-  // If the id was just an identifier (legacy/fallback), pick the best file
   if (!filename) {
     try {
       const meta = await fetchMetadata(identifier);
@@ -411,21 +496,20 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
       if (!best) return res.status(404).json({ error: 'No audio file found for this item.' });
       return res.json({
         url:    `${IA_BASE}/download/${identifier}/${encodeURIComponent(best.name)}`,
-        format: formatFromName(best.name)
+        format: formatFromFile(best)
       });
     } catch (e) {
       return res.status(500).json({ error: 'Stream resolution failed: ' + e.message });
     }
   }
 
-  // Tracks already carry a streamURL, so this is mainly a safety fallback
   res.json({
     url:    `${IA_BASE}/download/${identifier}/${encodeURIComponent(filename)}`,
-    format: formatFromName(filename)
+    format: filename.split('.').pop().toLowerCase() || 'mp3'
   });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[IA Addon] Running on http://0.0.0.0:${PORT}`);
+  console.log(`[IA Addon] v1.1.0 running on http://0.0.0.0:${PORT}`);
 });
