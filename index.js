@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-const UA      = 'Mozilla/5.0 (compatible; EclipseIAAddon/1.0.0)';
+const UA      = 'Mozilla/5.0 (compatible; EclipseIAAddon/1.2.0)';
 const IA_BASE = 'https://archive.org';
 
 // ─── Redis ───────────────────────────────────────────────────────────────────
@@ -25,10 +25,8 @@ if (process.env.REDIS_URL) {
 
 async function cacheGet(key) {
   if (!redis) return null;
-  try {
-    const d = await redis.get(key);
-    return d ? JSON.parse(d) : null;
-  } catch (_e) { return null; }
+  try { const d = await redis.get(key); return d ? JSON.parse(d) : null; }
+  catch (_e) { return null; }
 }
 
 async function cacheSet(key, value, ttlSeconds) {
@@ -44,17 +42,12 @@ const MAX_TOKENS_PER_IP = 10;
 const RATE_MAX          = 120;
 const RATE_WINDOW_MS    = 60000;
 
-function generateToken() {
-  return crypto.randomBytes(14).toString('hex');
-}
+function generateToken() { return crypto.randomBytes(14).toString('hex'); }
 
 function getOrCreateIpBucket(ip) {
   const now = Date.now();
   let b = IP_CREATES.get(ip);
-  if (!b || now > b.resetAt) {
-    b = { count: 0, resetAt: now + 86400000 };
-    IP_CREATES.set(ip, b);
-  }
+  if (!b || now > b.resetAt) { b = { count: 0, resetAt: now + 86400000 }; IP_CREATES.set(ip, b); }
   return b;
 }
 
@@ -62,21 +55,14 @@ async function getTokenEntry(token) {
   if (TOKEN_CACHE.has(token)) return TOKEN_CACHE.get(token);
   const saved = await cacheGet('ia:token:' + token);
   if (!saved) return null;
-  const entry = {
-    createdAt: saved.createdAt,
-    lastUsed:  saved.lastUsed,
-    reqCount:  saved.reqCount,
-    rateWin:   []
-  };
+  const entry = { createdAt: saved.createdAt, lastUsed: saved.lastUsed, reqCount: saved.reqCount, rateWin: [] };
   TOKEN_CACHE.set(token, entry);
   return entry;
 }
 
 async function saveToken(token, entry) {
   await cacheSet('ia:token:' + token, {
-    createdAt: entry.createdAt,
-    lastUsed:  entry.lastUsed,
-    reqCount:  entry.reqCount
+    createdAt: entry.createdAt, lastUsed: entry.lastUsed, reqCount: entry.reqCount
   }, 30 * 24 * 3600);
 }
 
@@ -103,41 +89,51 @@ function getBaseUrl(req) {
   return (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
 }
 
-// ─── Internet Archive API helpers ────────────────────────────────────────────
-async function iaGet(url, params) {
+// ─── IA HTTP helper ───────────────────────────────────────────────────────────
+// timeoutMs is explicit so search calls can use shorter timeouts (5s)
+// while metadata/stream calls can use longer ones (12s).
+async function iaGet(url, params, timeoutMs) {
   const r = await axios.get(url, {
     params:  params || {},
     headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-    timeout: 15000
+    timeout: timeoutMs || 12000
   });
   return r.data;
 }
 
-// Fetch item metadata, cached in Redis for 1 hour
+// Wrap any promise with a hard timeout that resolves to null instead of throwing.
+function withTimeout(promise, ms) {
+  const timer = new Promise(resolve => setTimeout(() => resolve(null), ms));
+  return Promise.race([promise, timer]);
+}
+
+// ─── Metadata (cached 1 hour) ─────────────────────────────────────────────────
 async function fetchMetadata(identifier) {
   const key    = 'ia:meta:' + identifier;
   const cached = await cacheGet(key);
   if (cached) return cached;
-  const data = await iaGet(`${IA_BASE}/metadata/${identifier}`);
+  const data = await iaGet(`${IA_BASE}/metadata/${identifier}`, null, 12000);
   if (data && data.metadata) await cacheSet(key, data, 3600);
   return data;
 }
 
-// ─── FIX 1: Two-tier search (targeted first, then broad fallback) ─────────────
+// ─── Search: two-tier, NO metadata fetch ─────────────────────────────────────
 //
-// Targeted: only items where the query is in title OR creator field.
-//           Sorted by downloads (most popular first).
-// Broad:    general full-text search as a fallback if targeted returns < 3 hits.
-// This prevents podcast episodes that *mention* an artist from dominating results.
+// v1.1 fetched metadata for 5 items in parallel during every search call.
+// Each metadata fetch takes 1-5 seconds — so search could block for 5+ seconds.
+//
+// v1.2 fix: search is now a single IA advancedsearch call (~500ms).
+// Track IDs from search are just the identifier (no filename).
+// The /stream endpoint handles identifier-only IDs by picking the best file.
 //
 async function searchAudio(query, limit) {
-  const safeKey = 'ia:search2:' + query.toLowerCase().replace(/[^a-z0-9]/g, '_').slice(0, 60);
+  const safeKey = 'ia:search3:' + query.toLowerCase().replace(/[^a-z0-9]/g, '_').slice(0, 60);
   const cached  = await cacheGet(safeKey);
   if (cached) return cached;
 
-  const fields = 'identifier,title,creator,year,date,description,subject,downloads';
+  const fields = 'identifier,title,creator,year,date,downloads';
 
-  // Tier 1 — title/creator match, sorted by downloads
+  // Tier 1 — targeted: title/creator match only, sorted by downloads
   let docs = [];
   try {
     const r = await iaGet(`${IA_BASE}/advancedsearch.php`, {
@@ -147,11 +143,11 @@ async function searchAudio(query, limit) {
       page:     1,
       'fl[]':   fields,
       'sort[]': 'downloads desc'
-    });
+    }, 7000);
     docs = (r && r.response && r.response.docs) || [];
   } catch (_e) {}
 
-  // Tier 2 — broad fallback if we got fewer than 3 targeted hits
+  // Tier 2 — broad fallback if tier 1 returned < 3 hits
   if (docs.length < 3) {
     try {
       const r2 = await iaGet(`${IA_BASE}/advancedsearch.php`, {
@@ -161,51 +157,75 @@ async function searchAudio(query, limit) {
         page:     1,
         'fl[]':   fields,
         'sort[]': 'downloads desc'
-      });
-      const broadDocs = (r2 && r2.response && r2.response.docs) || [];
-      // Merge: targeted first, then broad (no duplicates)
-      const seen = new Set(docs.map(d => d.identifier));
-      for (const d of broadDocs) {
+      }, 7000);
+      const broad = (r2 && r2.response && r2.response.docs) || [];
+      const seen  = new Set(docs.map(d => d.identifier));
+      for (const d of broad) {
         if (!seen.has(d.identifier)) { seen.add(d.identifier); docs.push(d); }
         if (docs.length >= (limit || 20)) break;
       }
     } catch (_e) {}
   }
 
-  await cacheSet(safeKey, docs, 180); // 3-minute cache
+  await cacheSet(safeKey, docs, 180);
   return docs;
 }
 
-// ─── FIX 2: Robust audio file detection ───────────────────────────────────────
-//
-// Previous version only checked file extension. IA stores files with:
-//   - format: "VBR MP3", "128Kbps MP3", "Ogg Vorbis", "Flac", "Shorten", etc.
-//   - extensions: .mp3, .flac, .ogg, .shn (Shorten — used in etree concerts), .m4a, etc.
-// We now check BOTH extension AND format field, and exclude non-audio by extension.
-//
-const NON_AUDIO_EXT = /\.(xml|sqlite|jpg|jpeg|png|gif|txt|nfo|log|pdf|torrent|zip|gz|bz2|json|cue|m3u|m3u8|sha1|md5|htm|html|css|js|db|idx|ffp|st5|md5|asc|info)$/i;
+// ─── Audio file detection ─────────────────────────────────────────────────────
+const NON_AUDIO_EXT = /\.(xml|sqlite|jpg|jpeg|png|gif|txt|nfo|log|pdf|torrent|zip|gz|bz2|json|cue|m3u|m3u8|sha1|md5|htm|html|css|js|db|idx|ffp|st5|asc|info)$/i;
 const AUDIO_EXT     = /\.(mp3|flac|ogg|oga|m4a|aac|wav|opus|shn|wma|spx|ra|rm|ape|wv)$/i;
 const AUDIO_FMT     = /\b(mp3|flac|ogg|vorbis|aac|m4a|wav|opus|shorten|wma|audio)\b/i;
 
 function isAudioFile(f) {
   if (!f || !f.name) return false;
-  if (f.source === 'metadata') return false;             // .xml, .sqlite descriptors
-  if (NON_AUDIO_EXT.test(f.name)) return false;          // obvious non-audio by extension
-  if (AUDIO_EXT.test(f.name)) return true;               // known audio extension ✓
-  if (AUDIO_FMT.test(f.format || '')) return true;       // known audio format field ✓
+  if (f.source === 'metadata') return false;
+  if (NON_AUDIO_EXT.test(f.name)) return false;
+  if (AUDIO_EXT.test(f.name)) return true;
+  if (AUDIO_FMT.test(f.format || '')) return true;
   return false;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Cover art detection ──────────────────────────────────────────────────────
+//
+// archive.org/services/img/{id} returns a black-and-white waveform image for
+// audio items that have no uploaded cover art. This looks bad in Eclipse.
+//
+// When we have the full metadata (album detail), we scan the files list for
+// actual image files and prefer them over the services/img endpoint.
+// If no cover image is found in the file list, we return null (Eclipse
+// shows its own placeholder — better than a waveform).
+//
+function findCoverArt(identifier, files) {
+  const images = (files || []).filter(f => {
+    if (!f || !f.name) return false;
+    if (!/\.(jpg|jpeg|png)$/i.test(f.name)) return false;
+    // Skip spectrogram/waveform images that IA auto-generates
+    if (/spectrogram|waveform|spec_|\.spec\.|_spectrogram|_waveform/i.test(f.name)) return false;
+    // Skip tiny thumbnails
+    if (/thumb|\.thumb\./i.test(f.name)) return false;
+    return true;
+  });
+
+  if (!images.length) return null;
+
+  // Prefer files with cover-like names
+  const preferred = images.find(f =>
+    /\b(cover|folder|front|artwork|album.?art|image|poster)\b/i.test(f.name)
+  );
+  const img = preferred || images[0];
+  return `${IA_BASE}/download/${identifier}/${encodeURIComponent(img.name)}`;
+}
+
+// ─── Track helpers ────────────────────────────────────────────────────────────
 function formatFromFile(f) {
   const ext = (f.name || '').split('.').pop().toLowerCase();
   const fmt = (f.format || '').toLowerCase();
-  if (ext === 'flac' || /flac/.test(fmt))            return 'flac';
-  if (ext === 'ogg'  || /ogg|vorbis/.test(fmt))      return 'ogg';
-  if (ext === 'm4a'  || /m4a|aac/.test(fmt))         return 'm4a';
-  if (ext === 'wav'  || /wav/.test(fmt))              return 'wav';
-  if (ext === 'opus' || /opus/.test(fmt))             return 'ogg';
-  return 'mp3'; // default / shn derivatives are usually served as mp3
+  if (ext === 'flac' || /flac/.test(fmt))       return 'flac';
+  if (ext === 'ogg'  || /ogg|vorbis/.test(fmt)) return 'ogg';
+  if (ext === 'm4a'  || /m4a|aac/.test(fmt))    return 'm4a';
+  if (ext === 'wav'  || /wav/.test(fmt))         return 'wav';
+  if (ext === 'opus' || /opus/.test(fmt))        return 'ogg';
+  return 'mp3';
 }
 
 function parseDuration(d) {
@@ -219,31 +239,15 @@ function parseDuration(d) {
   return null;
 }
 
-function cleanStr(s) {
-  return String(s || '').replace(/\s+/g, ' ').trim();
-}
+function cleanStr(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+function firstOf(v)  { return Array.isArray(v) ? v[0] : v; }
 
-function firstOf(v) {
-  return Array.isArray(v) ? v[0] : v;
-}
-
-// ─── FIX 3: Better track title extraction ─────────────────────────────────────
-//
-// IA file entries can have:
-//   - file.title:  clean track title (when set by uploader)
-//   - file.name:   filename — may be a hash (e.g. "iztbbkgurvn1w...") or clean
-// If file.title is absent or looks like a hash, fall back to item title + track number.
-//
 function isHashName(s) {
   return /^[a-f0-9]{8,}$/i.test(s) || /^[a-zA-Z0-9]{20,}$/.test(s);
 }
 
 function cleanFilenameAsTitle(filename) {
-  return filename
-    .replace(/\.[^.]+$/, '')
-    .replace(/[_-]/g, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
+  return filename.replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ').replace(/\s{2,}/g, ' ').trim();
 }
 
 function buildTrackId(identifier, filename) {
@@ -259,11 +263,9 @@ function parseTrackId(id) {
   };
 }
 
-function artworkUrl(identifier) {
-  return `${IA_BASE}/services/img/${identifier}`;
-}
-
-function buildTrack(identifier, file, meta, trackIndex) {
+// Build a full track object from an IA file entry + item metadata.
+// artworkURL is passed in explicitly so album detail can pass a real cover URL.
+function buildTrack(identifier, file, meta, trackIndex, artworkURL) {
   let rawTitle = cleanStr(firstOf(file.title));
   if (!rawTitle || isHashName(rawTitle)) {
     const fromFilename = cleanFilenameAsTitle(file.name);
@@ -271,22 +273,13 @@ function buildTrack(identifier, file, meta, trackIndex) {
       ? (cleanStr(firstOf(meta && meta.title)) + (trackIndex != null ? ' — Track ' + (trackIndex + 1) : ''))
       : fromFilename;
   }
-  const title  = rawTitle || 'Unknown Track';
-  const artist = cleanStr(
-    firstOf(file.artist)  ||
-    firstOf(file.creator) ||
-    firstOf(meta && meta.creator) ||
-    'Internet Archive'
-  );
-  const album  = cleanStr(firstOf(meta && meta.title) || '');
-
   return {
     id:         buildTrackId(identifier, file.name),
-    title,
-    artist,
-    album:      album || null,
+    title:      rawTitle || 'Unknown Track',
+    artist:     cleanStr(firstOf(file.artist) || firstOf(file.creator) || firstOf(meta && meta.creator) || 'Internet Archive'),
+    album:      cleanStr(firstOf(meta && meta.title)) || null,
     duration:   parseDuration(file.length),
-    artworkURL: artworkUrl(identifier),
+    artworkURL: artworkURL || null,
     format:     formatFromFile(file),
     streamURL:  `${IA_BASE}/download/${identifier}/${encodeURIComponent(file.name)}`
   };
@@ -295,7 +288,6 @@ function buildTrack(identifier, file, meta, trackIndex) {
 function pickBestFile(files) {
   const audio = files.filter(isAudioFile);
   if (!audio.length) return null;
-
   const score = f => {
     let s = 0;
     const ext = (f.name || '').split('.').pop().toLowerCase();
@@ -305,7 +297,6 @@ function pickBestFile(files) {
     if (t && !isHashName(t)) s += 20;
     return s;
   };
-
   return audio.slice().sort((a, b) => score(b) - score(a))[0] || null;
 }
 
@@ -335,7 +326,6 @@ function buildConfigPage(baseUrl) {
   h += '.pills{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px}';
   h += '.pill{border-radius:20px;font-size:11px;font-weight:600;padding:4px 10px;background:#0d1a2e;color:#4a9eff;border:1px solid #1a3a6e}';
   h += '.pill.g{background:#0d1f0d;color:#5a9e5a;border-color:#1a3a1a}';
-  h += '.lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#555;margin-bottom:6px;margin-top:16px}';
   h += '.box{display:none;background:#0a0a0f;border:1px solid #1e1e2e;border-radius:12px;padding:18px;margin-bottom:14px}';
   h += '.blbl{font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}';
   h += '.burl{font-size:12px;color:#4a9eff;word-break:break-all;font-family:"SF Mono",monospace;margin-bottom:14px;line-height:1.5}';
@@ -351,17 +341,17 @@ function buildConfigPage(baseUrl) {
   h += '<div><div class="logo-text">Internet Archive</div><div class="logo-sub">Eclipse Music Addon</div></div></div>';
   h += '<div class="card"><h1>Internet Archive for Eclipse</h1>';
   h += '<div class="tip"><b>Free forever.</b> The Internet Archive is a nonprofit library — millions of concerts, old-time radio shows, audiobooks, and historical recordings, all freely streamable.</div>';
-  h += '<p class="sub">Search and stream audio from archive.org directly inside Eclipse. Best for live concerts (Grateful Dead, Phish, etc.), old-time radio, audiobooks, and rare recordings.</p>';
+  h += '<p class="sub">Best for live concerts, old-time radio, audiobooks, and rare historical recordings from archive.org.</p>';
   h += '<div class="pills"><span class="pill">Live concerts</span><span class="pill">Old-time radio</span><span class="pill g">Free &amp; open</span><span class="pill">Audiobooks</span><span class="pill">Historical recordings</span></div>';
   h += '<button class="bb" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
   h += '<div class="box" id="genBox"><div class="blbl">Your addon URL — paste into Eclipse</div><div class="burl" id="genUrl"></div><button class="bd" id="copyBtn" onclick="copyUrl()">Copy URL</button></div>';
   h += '<hr><div class="steps">';
-  h += '<div class="step"><div class="sn">1</div><div class="st">Click <b>Generate</b> above and copy your URL</div></div>';
+  h += '<div class="step"><div class="sn">1</div><div class="st">Click <b>Generate</b> and copy your URL</div></div>';
   h += '<div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> → Settings → Connections → Add Connection → Addon</div></div>';
   h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>';
-  h += '<div class="step"><div class="sn">4</div><div class="st">Select <b>Internet Archive</b> in the search dropdown — works best for live concerts, old radio, and audiobooks</div></div>';
+  h += '<div class="step"><div class="sn">4</div><div class="st">Select <b>Internet Archive</b> in the search dropdown</div></div>';
   h += '</div></div>';
-  h += '<footer>Internet Archive Addon for Eclipse v1.1.0 • <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
+  h += '<footer>Internet Archive Addon for Eclipse v1.2.0 • <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
   h += '<script>';
   h += 'var _url="";';
   h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";';
@@ -380,21 +370,13 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({
-    status:         'ok',
-    version:        '1.1.0',
-    redisConnected: !!(redis && redis.status === 'ready'),
-    activeTokens:   TOKEN_CACHE.size,
-    timestamp:      new Date().toISOString()
-  });
+  res.json({ status: 'ok', version: '1.2.0', redisConnected: !!(redis && redis.status === 'ready'), activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
 });
 
 app.post('/generate', async (req, res) => {
   const ip     = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
   const bucket = getOrCreateIpBucket(ip);
-  if (bucket.count >= MAX_TOKENS_PER_IP) {
-    return res.status(429).json({ error: 'Too many tokens today from this IP.' });
-  }
+  if (bucket.count >= MAX_TOKENS_PER_IP) return res.status(429).json({ error: 'Too many tokens today from this IP.' });
   const token = generateToken();
   const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [] };
   TOKEN_CACHE.set(token, entry);
@@ -408,7 +390,7 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   res.json({
     id:          'com.eclipse.internetarchive.' + req.params.token.slice(0, 8),
     name:        'Internet Archive',
-    version:     '1.1.0',
+    version:     '1.2.0',
     description: 'Stream millions of free audio recordings — live concerts, old-time radio, audiobooks, and rare historical recordings from archive.org.',
     icon:        'https://archive.org/images/glogo.jpg',
     resources:   ['search', 'stream', 'catalog'],
@@ -417,39 +399,51 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
 });
 
 // ─── Search ───────────────────────────────────────────────────────────────────
+// v1.2: Zero metadata fetches during search.
+// Tracks come directly from the search docs (identifier only as ID).
+// The /stream endpoint handles identifier-only IDs by picking the best file.
+// artworkURL is null for tracks to avoid the black-and-white waveform thumbnail.
+// Albums use services/img (real cover art shows for items that have it).
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const q = cleanStr(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [] });
 
-  try {
-    const docs = await searchAudio(q, 20);
-    if (!docs.length) return res.json({ tracks: [], albums: [] });
+  // Hard 10-second ceiling on the entire search response
+  const deadline = new Promise(resolve =>
+    setTimeout(() => resolve({ tracks: [], albums: [], _timeout: true }), 10000)
+  );
 
+  const doSearch = async () => {
+    const docs = await searchAudio(q, 20);
+    if (!docs.length) return { tracks: [], albums: [] };
+
+    // Albums — one per IA item, artwork from services/img
     const albums = docs.map(doc => ({
       id:         doc.identifier,
       title:      cleanStr(firstOf(doc.title) || doc.identifier),
       artist:     cleanStr(firstOf(doc.creator) || 'Internet Archive'),
-      artworkURL: artworkUrl(doc.identifier),
+      artworkURL: `${IA_BASE}/services/img/${doc.identifier}`,
       year:       cleanStr(firstOf(doc.year) || (firstOf(doc.date) || '').slice(0, 4)) || null,
       trackCount: null
     }));
 
-    const topDocs    = docs.slice(0, 5);
-    const trackProms = topDocs.map(doc =>
-      fetchMetadata(doc.identifier)
-        .then(meta => {
-          if (!meta || !meta.files) return null;
-          const audio = meta.files.filter(isAudioFile);
-          if (!audio.length) return null;
-          const best = pickBestFile(audio);
-          if (!best) return null;
-          return buildTrack(doc.identifier, best, meta.metadata, null);
-        })
-        .catch(() => null)
-    );
-    const tracks = (await Promise.all(trackProms)).filter(Boolean);
+    // Tracks — same docs, no metadata fetch needed.
+    // ID = just the identifier. artworkURL = null (no waveform thumbnails).
+    // /stream will pick the best file on demand.
+    const tracks = docs.slice(0, 10).map(doc => ({
+      id:         doc.identifier,
+      title:      cleanStr(firstOf(doc.title) || doc.identifier),
+      artist:     cleanStr(firstOf(doc.creator) || 'Internet Archive'),
+      artworkURL: null,
+      format:     'mp3'
+    }));
 
-    res.json({ tracks, albums });
+    return { tracks, albums };
+  };
+
+  try {
+    const result = await Promise.race([doSearch(), deadline]);
+    res.json(result);
   } catch (e) {
     console.error('[search] error:', e.message);
     res.status(500).json({ error: 'Search failed.', tracks: [], albums: [] });
@@ -457,27 +451,30 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
 });
 
 // ─── Album detail ─────────────────────────────────────────────────────────────
+// Fetches full metadata. Uses findCoverArt() to get a real image file from
+// the item's file list — avoids the waveform from services/img.
 app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   const identifier = req.params.id;
   try {
-    const meta = await fetchMetadata(identifier);
+    const meta = await withTimeout(fetchMetadata(identifier), 12000);
     if (!meta || !meta.metadata) return res.status(404).json({ error: 'Item not found.' });
 
     const m          = meta.metadata;
     const allFiles   = meta.files || [];
     const audioFiles = sortAudioFiles(allFiles.filter(isAudioFile));
+    const coverArt   = findCoverArt(identifier, allFiles);
 
-    console.log(`[album] ${identifier}: ${allFiles.length} total files, ${audioFiles.length} audio`);
+    console.log(`[album] ${identifier}: ${allFiles.length} total, ${audioFiles.length} audio, cover: ${coverArt ? 'yes' : 'no'}`);
 
     res.json({
       id:          identifier,
       title:       cleanStr(firstOf(m.title) || identifier),
       artist:      cleanStr(firstOf(m.creator) || 'Internet Archive'),
-      artworkURL:  artworkUrl(identifier),
+      artworkURL:  coverArt,   // null if no real image found — Eclipse shows its own placeholder
       year:        cleanStr((firstOf(m.year) || firstOf(m.date) || '').slice(0, 4)) || null,
       description: cleanStr(firstOf(m.description) || ''),
       trackCount:  audioFiles.length,
-      tracks:      audioFiles.map((f, i) => buildTrack(identifier, f, m, i))
+      tracks:      audioFiles.map((f, i) => buildTrack(identifier, f, m, i, coverArt))
     });
   } catch (e) {
     console.error('[album] error:', e.message);
@@ -486,14 +483,18 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
 });
 
 // ─── Stream resolution ────────────────────────────────────────────────────────
+// Handles two ID formats:
+//   1. "{identifier}___{base64url(filename)}" — direct, no metadata needed
+//   2. "{identifier}" only — fetch metadata and pick the best audio file
 app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
   const { identifier, filename } = parseTrackId(req.params.id);
 
   if (!filename) {
     try {
-      const meta = await fetchMetadata(identifier);
+      const meta = await withTimeout(fetchMetadata(identifier), 12000);
+      if (!meta) return res.status(504).json({ error: 'Metadata fetch timed out.' });
       const best = pickBestFile((meta.files || []).filter(isAudioFile));
-      if (!best) return res.status(404).json({ error: 'No audio file found for this item.' });
+      if (!best) return res.status(404).json({ error: 'No audio file found.' });
       return res.json({
         url:    `${IA_BASE}/download/${identifier}/${encodeURIComponent(best.name)}`,
         format: formatFromFile(best)
@@ -511,5 +512,5 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[IA Addon] v1.1.0 running on http://0.0.0.0:${PORT}`);
+  console.log(`[IA Addon] v1.2.0 running on http://0.0.0.0:${PORT}`);
 });
